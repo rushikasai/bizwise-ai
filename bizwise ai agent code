@@ -1,0 +1,482 @@
+import os
+import json
+import asyncio
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+from openai import OpenAI
+from uagents import Agent, Context, Protocol
+from uagents_core.contrib.protocols.chat import (
+    ChatMessage,
+    ChatAcknowledgement,
+    TextContent,
+    chat_protocol_spec,
+)
+
+
+# ==================================================
+# CONFIGURATION
+# ==================================================
+
+DB_NAME = "bizwise.db"
+ASI_API_KEY = os.getenv("ASI_API_KEY") or os.getenv("ASI1_API_KEY")
+ASI_BASE_URL = os.getenv("ASI1_BASE_URL", "https://api.asi1.ai/v1")
+ASI_MODEL = os.getenv("ASI_MODEL", "asi1")
+
+if not ASI_API_KEY:
+    raise RuntimeError("Set ASI_API_KEY or ASI1_API_KEY in Agentverse Secrets.")
+
+client = OpenAI(api_key=ASI_API_KEY, base_url=ASI_BASE_URL)
+
+
+# ==================================================
+# DATABASE
+# ==================================================
+
+def connect_db():
+    return sqlite3.connect(DB_NAME)
+
+
+def setup_database():
+    with connect_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                cost REAL NOT NULL DEFAULT 0,
+                price REAL NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                product TEXT,
+                quantity INTEGER DEFAULT 0,
+                amount REAL DEFAULT 0,
+                cost_amount REAL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                amount REAL NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS suppliers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                item TEXT,
+                price REAL DEFAULT 0,
+                contact TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rating INTEGER NOT NULL,
+                review TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def validate_amount(value):
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError("Enter a valid numeric amount.")
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("Amount cannot be negative.")
+    return float(amount)
+
+
+# ==================================================
+# BUSINESS FUNCTIONS
+# ==================================================
+
+def add_product(name, quantity, cost, price):
+    name = name.strip()
+    quantity = int(quantity)
+    if not name or quantity < 0:
+        return "Product name must be provided and quantity cannot be negative."
+    cost = validate_amount(cost)
+    price = validate_amount(price)
+
+    with connect_db() as conn:
+        conn.execute("""
+            INSERT INTO products(name, quantity, cost, price)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                quantity = excluded.quantity,
+                cost = excluded.cost,
+                price = excluded.price
+        """, (name, quantity, cost, price))
+
+    return f"Saved {name}: stock={quantity}, cost=₹{cost:.2f}, selling price=₹{price:.2f}."
+
+
+def purchase_stock(name, quantity, unit_cost):
+    quantity = int(quantity)
+    unit_cost = validate_amount(unit_cost)
+    if quantity <= 0:
+        return "Quantity must be greater than zero."
+    total = quantity * unit_cost
+
+    with connect_db() as conn:
+        product = conn.execute(
+            "SELECT id FROM products WHERE name = ?", (name,)
+        ).fetchone()
+        if not product:
+            return "Product not found. Add it before recording a purchase."
+        conn.execute(
+            "UPDATE products SET quantity = quantity + ? WHERE name = ?",
+            (quantity, name),
+        )
+        conn.execute("""
+            INSERT INTO transactions
+            (kind, product, quantity, amount, cost_amount, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("purchase", name, quantity, total, total, timestamp()))
+
+    return f"Purchase recorded: {quantity} units of {name}, total ₹{total:.2f}."
+
+
+def sell_product(name, quantity):
+    quantity = int(quantity)
+    if quantity <= 0:
+        return "Quantity must be greater than zero."
+
+    with connect_db() as conn:
+        product = conn.execute(
+            "SELECT quantity, cost, price FROM products WHERE name = ?", (name,)
+        ).fetchone()
+        if not product:
+            return "Product not found."
+
+        stock, cost, price = product
+        if stock < quantity:
+            return f"Insufficient stock. Available quantity: {stock}."
+
+        revenue = quantity * price
+        cost_amount = quantity * cost
+
+        conn.execute(
+            "UPDATE products SET quantity = quantity - ? WHERE name = ?",
+            (quantity, name),
+        )
+        conn.execute("""
+            INSERT INTO transactions
+            (kind, product, quantity, amount, cost_amount, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("sale", name, quantity, revenue, cost_amount, timestamp()))
+
+    return (
+        f"Sale recorded: {quantity} × {name}. "
+        f"Revenue ₹{revenue:.2f}; estimated gross profit ₹{revenue - cost_amount:.2f}."
+    )
+
+
+def add_expense(category, amount, note=""):
+    amount = validate_amount(amount)
+    with connect_db() as conn:
+        conn.execute("""
+            INSERT INTO expenses(category, amount, note, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (category, amount, note, timestamp()))
+    return f"Expense recorded: {category}, ₹{amount:.2f}."
+
+
+def add_supplier(name, item="", price=0, contact=""):
+    price = validate_amount(price)
+    with connect_db() as conn:
+        conn.execute("""
+            INSERT INTO suppliers(name, item, price, contact)
+            VALUES (?, ?, ?, ?)
+        """, (name, item, price, contact))
+    return f"Supplier saved: {name}; item: {item}; listed price: ₹{price:.2f}."
+
+
+def add_review(rating, review):
+    rating = int(rating)
+    if rating < 1 or rating > 5:
+        return "Rating must be between 1 and 5."
+    with connect_db() as conn:
+        conn.execute("""
+            INSERT INTO reviews(rating, review, created_at)
+            VALUES (?, ?, ?)
+        """, (rating, review, timestamp()))
+    return "Customer review saved."
+
+
+def inventory_report():
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT name, quantity, cost, price FROM products ORDER BY name"
+        ).fetchall()
+    if not rows:
+        return "Inventory is empty."
+    return "\n".join(
+        f"{n}: {q} units; cost ₹{c:.2f}; selling price ₹{p:.2f}"
+        for n, q, c, p in rows
+    )
+
+
+def daily_report():
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    with connect_db() as conn:
+        revenue, cogs = conn.execute("""
+            SELECT COALESCE(SUM(amount), 0), COALESCE(SUM(cost_amount), 0)
+            FROM transactions
+            WHERE kind='sale' AND substr(created_at, 1, 10)=?
+        """, (today,)).fetchone()
+
+        purchases = conn.execute("""
+            SELECT COALESCE(SUM(amount), 0) FROM transactions
+            WHERE kind='purchase' AND substr(created_at, 1, 10)=?
+        """, (today,)).fetchone()[0]
+
+        expenses = conn.execute("""
+            SELECT COALESCE(SUM(amount), 0) FROM expenses
+            WHERE substr(created_at, 1, 10)=?
+        """, (today,)).fetchone()[0]
+
+    gross_profit = revenue - cogs
+    return (
+        f"Report date (UTC): {today}\n"
+        f"Sales revenue: ₹{revenue:.2f}\n"
+        f"Estimated cost of goods sold: ₹{cogs:.2f}\n"
+        f"Estimated gross profit: ₹{gross_profit:.2f}\n"
+        f"Recorded expenses: ₹{expenses:.2f}\n"
+        f"Estimated operating result: ₹{gross_profit - expenses:.2f}\n"
+        f"Stock purchases: ₹{purchases:.2f}\n"
+        "Basic estimate only; taxes and other accounting adjustments are excluded."
+    )
+
+
+def supplier_report():
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT name, item, price, contact FROM suppliers ORDER BY name"
+        ).fetchall()
+    if not rows:
+        return "No suppliers saved yet."
+    return "\n".join(
+        f"{n} | {i} | ₹{p:.2f} | {c or 'No contact saved'}" for n, i, p, c in rows
+    )
+
+
+def review_report():
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT rating, review FROM reviews ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+    if not rows:
+        return "No customer reviews saved yet."
+    average = sum(r[0] for r in rows) / len(rows)
+    reviews = "\n".join(f"{r}/5: {t}" for r, t in rows)
+    return f"Average rating: {average:.2f}/5\n{reviews}"
+
+
+# ==================================================
+# AI TOOLS
+# ==================================================
+
+def tool_schema(name, description, properties, required=None):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required or [],
+            },
+        },
+    }
+
+
+TOOLS = [
+    tool_schema("add_product", "Add or update product stock and prices.", {
+        "name": {"type": "string"},
+        "quantity": {"type": "integer"},
+        "cost": {"type": "number"},
+        "price": {"type": "number"},
+    }, ["name", "quantity", "cost", "price"]),
+
+    tool_schema("purchase_stock", "Record stock purchased.", {
+        "name": {"type": "string"},
+        "quantity": {"type": "integer"},
+        "unit_cost": {"type": "number"},
+    }, ["name", "quantity", "unit_cost"]),
+
+    tool_schema("sell_product", "Record a sale and reduce inventory.", {
+        "name": {"type": "string"},
+        "quantity": {"type": "integer"},
+    }, ["name", "quantity"]),
+
+    tool_schema("add_expense", "Record a business expense.", {
+        "category": {"type": "string"},
+        "amount": {"type": "number"},
+        "note": {"type": "string"},
+    }, ["category", "amount"]),
+
+    tool_schema("add_supplier", "Save supplier information supplied by the user.", {
+        "name": {"type": "string"},
+        "item": {"type": "string"},
+        "price": {"type": "number"},
+        "contact": {"type": "string"},
+    }, ["name", "item", "price"]),
+
+    tool_schema("add_review", "Save a customer review.", {
+        "rating": {"type": "integer"},
+        "review": {"type": "string"},
+    }, ["rating", "review"]),
+
+    tool_schema("inventory_report", "Show current inventory.", {}, []),
+    tool_schema("daily_report", "Show daily sales and estimated profit/loss.", {}, []),
+    tool_schema("supplier_report", "Show saved suppliers.", {}, []),
+    tool_schema("review_report", "Show reviews for analysis.", {}, []),
+]
+
+FUNCTIONS = {
+    "add_product": add_product,
+    "purchase_stock": purchase_stock,
+    "sell_product": sell_product,
+    "add_expense": add_expense,
+    "add_supplier": add_supplier,
+    "add_review": add_review,
+    "inventory_report": inventory_report,
+    "daily_report": daily_report,
+    "supplier_report": supplier_report,
+    "review_report": review_report,
+}
+
+SYSTEM_PROMPT = (
+    "You are BizWise AI, a business assistant. Help with business "
+    "ideas, pricing, suppliers, location planning, inventory, sales, "
+    "expenses, reports and customer feedback. Use tools for saved "
+    "records. Never invent live supplier prices or contact details. "
+    "Before making a real transaction, ensure the user's instruction "
+    "clearly specifies the action and required details. Explain that "
+    "market prices and location demand are estimates unless verified."
+)
+
+
+def ask_bizwise(user_text):
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
+
+    for _ in range(5):
+        response = client.chat.completions.create(
+            model=ASI_MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+        )
+        message = response.choices[0].message
+
+        if not message.tool_calls:
+            return message.content or "Please try asking in another way."
+
+        messages.append(message.model_dump(exclude_none=True))
+
+        for call in message.tool_calls:
+            try:
+                function = FUNCTIONS[call.function.name]
+                arguments = json.loads(call.function.arguments or "{}")
+                result = function(**arguments)
+            except Exception as exc:
+                result = f"Tool error: {exc}"
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(result),
+            })
+
+    return "Too many steps in one request. Please try again."
+
+
+# ==================================================
+# AGENT
+# ==================================================
+
+# On Agentverse hosted agents, a plain Agent() is correct.
+# (For local runs, use: Agent(name="bizwise_ai", seed="...", port=8000, mailbox=True))
+agent = Agent()
+
+chat_protocol = Protocol(spec=chat_protocol_spec)
+
+
+# NOTE: No `replies=` here. The spec itself already defines the allowed replies
+# for ChatMessage, and passing a different set caused the ValueError.
+@chat_protocol.on_message(ChatMessage)
+async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
+    # Always acknowledge first
+    await ctx.send(
+        sender,
+        ChatAcknowledgement(
+            timestamp=datetime.now(timezone.utc),
+            acknowledged_msg_id=msg.msg_id,
+        ),
+    )
+
+    text_parts = [
+        item.text
+        for item in msg.content
+        if isinstance(item, TextContent) and item.text.strip()
+    ]
+    if not text_parts:
+        return
+
+    user_text = "\n".join(text_parts)
+
+    try:
+        # Run the blocking OpenAI/SQLite code off the event loop
+        reply = await asyncio.to_thread(ask_bizwise, user_text)
+    except Exception:
+        ctx.logger.exception("BizWise request failed")
+        reply = (
+            "Sorry, BizWise AI couldn't complete that request. "
+            "Please verify the ASI API key, model name, and endpoint."
+        )
+
+    await ctx.send(
+        sender,
+        ChatMessage(
+            timestamp=datetime.now(timezone.utc),
+            msg_id=uuid.uuid4(),
+            content=[TextContent(type="text", text=reply)],
+        ),
+    )
+
+
+# The protocol spec requires a handler for acknowledgements too.
+@chat_protocol.on_message(ChatAcknowledgement)
+async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    ctx.logger.info(f"Ack received from {sender} for {msg.acknowledged_msg_id}")
+
+
+agent.include(chat_protocol, publish_manifest=True)
+
+setup_database()
+
+if __name__ == "__main__":
+    agent.run()
